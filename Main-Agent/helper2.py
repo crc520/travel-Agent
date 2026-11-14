@@ -213,3 +213,4 @@ def get_max_version(session_id: str) -> int:
     if res[0] is None:
         return 0
     return int(res[0])
+

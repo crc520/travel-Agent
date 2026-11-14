@@ -1,4 +1,4 @@
-# 新建数据库时使用
+# 重建数据库时使用
 from helper2 import load_env, setup_mysql_database, connect_to_mysql
 import warnings
 
@@ -14,3 +14,4 @@ setup_mysql_database()
 database_connection = connect_to_mysql()
 
 print("Using user:", database_connection.user)
+

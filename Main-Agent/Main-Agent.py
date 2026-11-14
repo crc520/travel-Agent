@@ -13,24 +13,32 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.tools import Tool
 from mcp import StdioServerParameters, ClientSession
 from mcp.client.stdio import stdio_client
-from torch.nn.functional import embedding
+from langfuse.langchain import CallbackHandler
 
 from helper2 import save_memory, recall_memory, rebuild_chroma_from_mysql, save_snapshot, get_snapshot, get_max_version
 
 load_dotenv()
+langfuse_handler = CallbackHandler()
 
-PYTHON_EXE_PATH = os.getenv("PYTHON_EXE_PATH")
+# api_key=os.getenv("BAILIAN_API_KEY")
+
+# ====================== MCP 全局配置（从你之前FastAPI代码搬过来） ======================
 WEATHER_SCRIPT_PATH = os.getenv("WEATHER_SCRIPT_PATH")
 FS_SCRIPT_PATH = os.getenv("FS_SCRIPT_PATH")
-
+MEMORY_SERVER_PATH = os.getenv("MEMORY_SERVER_PATH")
+RAG_SERVER_PATH = os.getenv("RAG_SERVER_PATH")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL")
+PYTHON_EXE_PATH= os.getenv("PYTHON_EXE_PATH")
 
 MCP_SERVER_LIST = [
     {"service_id": "weather", "script_path": WEATHER_SCRIPT_PATH},
-    {"service_id": "fs", "script_path": FS_SCRIPT_PATH}
+    {"service_id": "fs", "script_path": FS_SCRIPT_PATH},
+    {"service_id": "rag", "script_path":RAG_SERVER_PATH},
+    {"service_id": "memory", "script_path": MEMORY_SERVER_PATH}
 ]
+
 # MCP 全局资源
 exit_stack = AsyncExitStack()
 mcp_sessions: dict[str, ClientSession] = {}
@@ -40,7 +48,7 @@ langchain_tool_list: list[Tool] = []
 
 async def start_single_mcp(service_id: str, script_path: str):
     params = StdioServerParameters(
-        command=PYTHON_EXE_PATH,
+        command= PYTHON_EXE_PATH,
         args=[script_path]
     )
     streams = await exit_stack.enter_async_context(stdio_client(params))
@@ -97,6 +105,7 @@ class State(TypedDict):
     long_memory: list
     base_version: int | None
     tool_messages: list  # 新增：工具调用消息栈
+    retrieved_chunks: list[str]
 
 # ====================== 2. LLM 初始化，绑定MCP工具schema ======================
 llm = ChatOpenAI(
@@ -124,11 +133,7 @@ def parse_base_version(state: State, config):
     return {"base_version": None, "tool_messages": []}
 
 # ---------------- 节点：召回长期记忆 ----------------
-def recall_long_memory(state: State, config):
-    session_id = config["configurable"]["thread_id"]
-    query = state["user_raw_requirement"]
-    memory_list = recall_memory(session_id, query, top_k=5)
-    return {"long_memory": memory_list}
+# 已封装成MCP工具
 
 # ---------------- 节点：提取事实、保存到长期记忆 ----------------
 def save_long_memory(state: State, config):
@@ -163,7 +168,6 @@ def save_travel_snapshot(state: State, config):
 
 # ====================== 提示词 ======================
 info_collect_prompt = ChatPromptTemplate.from_template("""
-历史长期记忆：{long_memory}
 用户原始需求：{user_raw_requirement}
 当前已收集信息：{travel_info}
 
@@ -174,15 +178,22 @@ info_collect_prompt = ChatPromptTemplate.from_template("""
 4.出行人数 
 5.出行偏好（休闲/徒步/美食打卡等）
 
+如果怀疑用户之前说过相关信息，调用工具 recall_user_memory(session_id, query) 查询历史记忆，不要凭空猜测。
+session_id固定为 travel_001
+
 如果有缺失，只返回缺失的字段名称，多个字段用中文逗号隔开；
 如果全部齐全：直接输出JSON，key为【目的地、出行日期、总预算、出行人数、出行偏好】，不要额外文字。
 """)
 
 plan_generate_prompt = ChatPromptTemplate.from_template("""
-历史长期记忆：{long_memory}
 基于下面用户出行信息，生成一份多日旅游规划方案。
 出行信息：{travel_info}
-你可以调用工具查询目的地天气、读取本地攻略文件，方案要结合天气情况。
+你可以调用工具：
+- recall_user_memory(session_id, query)：查询用户历史记忆，session_id固定travel_001
+- 查询目的地天气
+- search_travel_knowledge检索景点美食攻略
+
+方案要结合天气情况。
 
 方案包含：每日行程、餐饮建议。方案总字数不要超过120个字。
 """)
@@ -193,7 +204,8 @@ plan_refine_prompt = ChatPromptTemplate.from_template("""
 用户修改意见：{human_review_input}
 出行基础信息：{travel_info}
 
-根据用户意见调整旅游方案，可以调用工具查询天气。新方案总字数不要超过120个字。
+根据用户意见调整旅游方案，可以调用工具查询天气,读取本地文件、search_travel_knowledge检索景点美食攻略、recall_user_memory(session_id, query)：查询用户历史记忆，session_id固定travel_001
+新方案总字数不要超过120个字。
 """)
 
 # ====================== 节点1：收集 & 校验旅游信息 ======================
@@ -202,7 +214,9 @@ def check_travel_info(state: State):
         user_raw_requirement=state["user_raw_requirement"],
         travel_info=state.get("travel_info", {}),
         long_memory=state.get("long_memory", [])
-    ))
+    ),
+        config={"callbacks": [langfuse_handler]}
+    )
     content = resp.content.strip()
     try:
         parsed_info = json.loads(content)
@@ -230,7 +244,9 @@ def collect_missing_info(state: State):
         old_info=state.get("travel_info", {}),
         user_text=user_input_str,
         long_memory=state.get("long_memory", [])
-    ))
+    ),
+        config={"callbacks": [langfuse_handler]}
+    )
     try:
         new_info_part = json.loads(parse_resp.content)
     except Exception:
@@ -249,27 +265,40 @@ async def create_draft_plan_with_tools(state: State):
     ]
     messages.extend(state["tool_messages"])
     max_loop = 5
+    all_chunks = state.get("retrieved_chunks", [])
     for _ in range(max_loop):
-        resp =await llm.ainvoke(messages, tools=mcp_tools_schema)
+        resp =await llm.ainvoke(messages,
+                                tools=mcp_tools_schema,
+                                config={"callbacks": [langfuse_handler]})
         msg = resp.content
         tool_calls = resp.tool_calls
         if not tool_calls:
-            return {"travel_draft_plan": msg, "tool_messages": []}
+            return {"travel_draft_plan": msg, "tool_messages": messages, "retrieved_chunks": all_chunks}
         # 执行MCP工具
-        messages.append(resp.model_dump())
+        assistant_msg = {
+            "role": "assistant",
+            "content": msg,
+            "tool_calls": [tc if isinstance(tc, dict) else tc.model_dump() for tc in tool_calls]
+        }
+        messages.append(assistant_msg)
+
         for tc in tool_calls:
-            # ✅ 兼容：如果是对象就转dict，如果已经是dict直接用
-            if hasattr(tc, "model_dump"):
-                tc = tc.model_dump()
-            tool_name = tc["name"]
-            args = tc["args"]
+            tc_dict = tc if isinstance(tc, dict) else tc.model_dump()
+            tool_name = tc_dict["name"]
+            args = tc_dict["args"]
             res_text = await call_mcp_tool(tool_name, args)
+            # 只有search_travel_knowledge才解析json
+            if tool_name == "search_travel_knowledge":
+                data = json.loads(res_text)
+                res_text = data["content"]
+                all_chunks.extend(data["chunks"])
+
             messages.append({
                 "role": "tool",
-                "tool_call_id": tc["id"],
+                "tool_call_id": tc_dict["id"],
                 "content": res_text
             })
-    return {"travel_draft_plan": msg, "tool_messages": messages}
+    return {"travel_draft_plan": msg, "tool_messages": messages, "retrieved_chunks": all_chunks}
 
 # ====================== 节点4：人工审核方案 ======================
 def human_audit_plan(state: State):
@@ -307,25 +336,39 @@ async def revise_plan(state: State):
     ]
     messages.extend(state["tool_messages"])
     max_loop = 5
+    all_chunks = state.get("retrieved_chunks", [])
     for _ in range(max_loop):
-        resp =await llm.ainvoke(messages, tools=mcp_tools_schema)
+        resp =await llm.ainvoke(messages,
+                                tools=mcp_tools_schema,
+                                config={"callbacks": [langfuse_handler]})
         msg = resp.content
         tool_calls = resp.tool_calls
         if not tool_calls:
-            return {"travel_draft_plan": msg, "tool_messages": []}
-        messages.append(resp.model_dump())
+            return {"travel_draft_plan": msg, "tool_messages": messages, "retrieved_chunks": all_chunks}
+        assistant_msg = {
+            "role": "assistant",
+            "content": msg,
+            "tool_calls": [tc if isinstance(tc, dict) else tc.model_dump() for tc in tool_calls]
+        }
+        messages.append(assistant_msg)
+
         for tc in tool_calls:
-            if hasattr(tc, "model_dump"):
-                tc = tc.model_dump()
-            tool_name = tc["name"]
-            args = tc["args"]
+            tc_dict = tc if isinstance(tc, dict) else tc.model_dump()
+            tool_name = tc_dict["name"]
+            args = tc_dict["args"]
             res_text = await call_mcp_tool(tool_name, args)
+
+            if tool_name == "search_travel_knowledge":
+                data = json.loads(res_text)
+                res_text = data["content"]
+                all_chunks.extend(data["chunks"])
+
             messages.append({
                 "role": "tool",
-                "tool_call_id": tc["id"],
+                "tool_call_id": tc_dict["id"],
                 "content": res_text
             })
-    return {"travel_draft_plan": msg, "tool_messages": messages}
+    return {"travel_draft_plan": msg, "tool_messages": messages, "retrieved_chunks": all_chunks}
 
 # ====================== 路由 ======================
 def route_info_check(state: State):
@@ -338,15 +381,13 @@ def after_save_fact(state: State):
     return "save_travel_snapshot"
 
 def route_after_parse(state: State):
-    if state.get("base_version") is not None:
-        return "check_travel_info"
-    else:
-        return "recall_long_memory"
+    # 不管是否加载版本，直接进入信息收集，不再自动召回记忆
+    return "check_travel_info"
 
 # ====================== 构图 ======================
 builder = StateGraph(State)
 builder.add_node("parse_base_version", parse_base_version)
-builder.add_node("recall_long_memory", recall_long_memory)
+# builder.add_node("recall_long_memory", recall_long_memory)
 builder.add_node("check_travel_info", check_travel_info)
 builder.add_node("collect_missing_info", collect_missing_info)
 builder.add_node("create_draft_plan_with_tools", create_draft_plan_with_tools)
@@ -357,7 +398,7 @@ builder.add_node("save_travel_snapshot", save_travel_snapshot)
 
 builder.add_edge(START, "parse_base_version")
 builder.add_conditional_edges("parse_base_version", route_after_parse)
-builder.add_edge("recall_long_memory", "check_travel_info")
+# builder.add_edge("recall_long_memory", "check_travel_info")
 builder.add_conditional_edges("check_travel_info", route_info_check)
 builder.add_edge("create_draft_plan_with_tools", "human_audit_plan")
 builder.add_edge("revise_plan", "human_audit_plan")
@@ -383,18 +424,41 @@ async def main():
             "tool_messages": []
         }
         # 异步stream
-        async for event in graph.astream(input_payload, config, stream_mode="updates"):
+        async for event in graph.astream(input_payload,
+                                         config={
+                                             "configurable": {"thread_id": "travel_001"},
+                                             "callbacks": [langfuse_handler]
+                                         },
+                                         stream_mode="updates"):
             print(event)
         snapshot = await graph.aget_state(config)
         while snapshot.next:
             print("\n===== 等待你输入 =====")
-            user_input = input("请按提示输入内容：")
-            await graph.ainvoke(Command(resume=user_input), config)
+            human_review_input = input("请按提示输入内容：")
+            # 用astream执行resume，等待所有后续节点跑完
+            async for _ in graph.astream(Command(resume=human_review_input), config=config):
+                pass
             snapshot = await graph.aget_state(config)
             print("\n当前状态：", snapshot.values)
+
+        final_state = snapshot.values
+        final_answer = final_state.get("final_travel_plan", "")
+        chunk_list = final_state.get("retrieved_chunks", [])  # 这里！需要你在search节点把召回chunks写入state
+
+        eval_record = {
+            "user_input": user_input,
+            "retrieved_contexts": chunk_list,
+            "response": final_answer,
+            "reference": ""  # 没有标准答案就空
+        }
+        with open("eval_data.json", "w", encoding="utf-8") as f:
+            json.dump([eval_record], f, ensure_ascii=False, indent=2)
+        print("✅ 评测数据已保存 eval_data.json")
+
     finally:
         # 程序退出，关闭所有MCP子进程
         await shutdown_mcp()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
